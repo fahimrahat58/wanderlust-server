@@ -6,45 +6,143 @@ import "dotenv/config";
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
-app.use(express.json());
+const MONGODB_URI = process.env.MONGODB_URI;
+const AUTH_BASE_URL = process.env.AUTH_BASE_URL || "http://localhost:3000";
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
-if (!process.env.MONGODB_URI) {
+if (!MONGODB_URI) {
   throw new Error("MONGODB_URI is missing from .env file");
 }
 
-const client = new MongoClient(process.env.MONGODB_URI);
+const client = new MongoClient(MONGODB_URI);
+
+app.use(
+  cors({
+    origin: FRONTEND_URL,
+    credentials: true,
+  }),
+);
+
+app.use(express.json());
+
+function isValidId(id) {
+  return typeof id === "string" && /^[a-fA-F0-9]{24}$/.test(id);
+}
+
+function sendError(res, error, message) {
+  console.error(message, error);
+
+  return res.status(500).json({
+    message,
+  });
+}
+
+// Verify the user through Better Auth.
+// Never trust userId or email supplied in a request body.
+async function getAuthenticatedUser(req) {
+  const cookie = req.headers.cookie;
+
+  if (!cookie) {
+    return null;
+  }
+
+  const response = await fetch(
+    `${AUTH_BASE_URL.replace(/\/$/, "")}/api/auth/get-session`,
+    {
+      method: "GET",
+      headers: {
+        cookie,
+        accept: "application/json",
+      },
+      cache: "no-store",
+    },
+  );
+
+  if (!response.ok) {
+    return null;
+  }
+
+  const data = await response.json();
+  const user = data?.user;
+
+  if (!user?.id || !user?.email) {
+    return null;
+  }
+
+  return user;
+}
 
 async function startServer() {
   try {
     await client.connect();
 
     const db = client.db("wanderlust");
+
+    const usersCollection = db.collection("users");
     const destinationsCollection = db.collection("destinations");
+    const bookingsCollection = db.collection("bookings");
 
     console.log("MongoDB connected successfully");
 
-    // Get all destinations
+    // Create indexes for common lookups.
+    await bookingsCollection.createIndex({
+      userId: 1,
+      destinationId: 1,
+    });
+
+    await bookingsCollection.createIndex({
+      createdAt: -1,
+    });
+
+    // Save the verified Better Auth user in the Wanderlust users collection.
+    async function syncUser(authUser) {
+      const now = new Date();
+
+      const createdAt = authUser.createdAt ? new Date(authUser.createdAt) : now;
+
+      const updatedAt = authUser.updatedAt ? new Date(authUser.updatedAt) : now;
+
+      await usersCollection.updateOne(
+        { authUserId: String(authUser.id) },
+        {
+          $set: {
+            name: authUser.name || "",
+            email: authUser.email,
+            updatedAt,
+          },
+          $setOnInsert: {
+            authUserId: String(authUser.id),
+            createdAt,
+          },
+        },
+        { upsert: true },
+      );
+
+      return usersCollection.findOne({
+        authUserId: String(authUser.id),
+      });
+    }
+
+    // GET all destinations.
     app.get("/destinations", async (req, res) => {
       try {
-        const destinations = await destinationsCollection.find({}).toArray();
+        const destinations = await destinationsCollection
+          .find({})
+          .sort({ createdAt: -1 })
+          .toArray();
 
         return res.status(200).json(destinations);
       } catch (error) {
-        console.error("Error fetching destinations:", error);
-
-        return res.status(500).json({
-          message: "Failed to fetch destinations",
-        });
+        return sendError(res, error, "Failed to fetch destinations");
       }
     });
 
-    // Get a single destination by ID
+    // GET one destination.
     app.get("/destinations/:id", async (req, res) => {
       try {
         const { id } = req.params;
 
-        if (!ObjectId.isValid(id) || !/^[a-fA-F0-9]{24}$/.test(id)) {
+        if (!isValidId(id)) {
           return res.status(400).json({
             message: "Invalid destination ID",
           });
@@ -62,15 +160,11 @@ async function startServer() {
 
         return res.status(200).json(destination);
       } catch (error) {
-        console.error("Error fetching destination:", error);
-
-        return res.status(500).json({
-          message: "Failed to fetch destination details",
-        });
+        return sendError(res, error, "Failed to fetch destination details");
       }
     });
 
-    // Add a new destination
+    // CREATE destination.
     app.post("/adddestinations", async (req, res) => {
       try {
         const {
@@ -106,6 +200,8 @@ async function startServer() {
           });
         }
 
+        const now = new Date();
+
         const newDestination = {
           destinationName: destinationName.trim(),
           country: country.trim(),
@@ -114,41 +210,39 @@ async function startServer() {
               ? category.trim()
               : "Beach",
           price: numericPrice,
-          duration,
-          departureDate,
+          duration: typeof duration === "string" ? duration.trim() : "",
+          departureDate: departureDate || "",
           imageUrl:
             typeof imageUrl === "string" && imageUrl.trim()
               ? imageUrl.trim()
               : "https://images.unsplash.com/photo-1537996194471-e657df975ab4",
-          description,
+          description:
+            typeof description === "string" ? description.trim() : "",
           rating: 4.5,
-          createdAt: new Date(),
+          createdAt: now,
+          updatedAt: now,
         };
 
         const result = await destinationsCollection.insertOne(newDestination);
 
         return res.status(201).json({
-          message: "Package created successfully!",
-          package: {
+          message: "Destination created successfully!",
+          destination: {
             _id: result.insertedId,
             ...newDestination,
           },
         });
       } catch (error) {
-        console.error("Error creating destination:", error);
-
-        return res.status(500).json({
-          message: "Failed to create travel package",
-        });
+        return sendError(res, error, "Failed to create travel package");
       }
     });
 
-    // Update a destination by ID
+    // UPDATE destination.
     app.patch("/destinations/:id", async (req, res) => {
       try {
         const { id } = req.params;
 
-        if (!/^[a-fA-F0-9]{24}$/.test(id)) {
+        if (!isValidId(id)) {
           return res.status(400).json({
             message: "Invalid destination ID",
           });
@@ -189,7 +283,13 @@ async function startServer() {
         }
 
         if (category !== undefined) {
-          updates.category = category;
+          if (typeof category !== "string") {
+            return res.status(400).json({
+              message: "Category must be a string",
+            });
+          }
+
+          updates.category = category.trim();
         }
 
         if (price !== undefined) {
@@ -218,11 +318,23 @@ async function startServer() {
         }
 
         if (imageUrl !== undefined) {
-          updates.imageUrl = imageUrl;
+          if (typeof imageUrl !== "string") {
+            return res.status(400).json({
+              message: "Image URL must be a string",
+            });
+          }
+
+          updates.imageUrl = imageUrl.trim();
         }
 
         if (description !== undefined) {
-          updates.description = description;
+          if (typeof description !== "string") {
+            return res.status(400).json({
+              message: "Description must be a string",
+            });
+          }
+
+          updates.description = description.trim();
         }
 
         if (rating !== undefined) {
@@ -249,11 +361,18 @@ async function startServer() {
           });
         }
 
-        updates.updatedAt = new Date();
+        const now = new Date();
+
+        updates.updatedAt = now;
 
         const result = await destinationsCollection.updateOne(
           { _id: new ObjectId(id) },
-          { $set: updates },
+          {
+            $set: updates,
+            $setOnInsert: {
+              createdAt: now,
+            },
+          },
         );
 
         if (result.matchedCount === 0) {
@@ -261,6 +380,17 @@ async function startServer() {
             message: "Destination not found",
           });
         }
+
+        // Add createdAt only when an older document is missing it.
+        await destinationsCollection.updateOne(
+          {
+            _id: new ObjectId(id),
+            createdAt: { $exists: false },
+          },
+          {
+            $set: { createdAt: now },
+          },
+        );
 
         const updatedDestination = await destinationsCollection.findOne({
           _id: new ObjectId(id),
@@ -271,20 +401,16 @@ async function startServer() {
           destination: updatedDestination,
         });
       } catch (error) {
-        console.error("Error updating destination:", error);
-
-        return res.status(500).json({
-          message: "Failed to update destination",
-        });
+        return sendError(res, error, "Failed to update destination");
       }
     });
 
-    // Delete a destination by ID
+    // DELETE destination.
     app.delete("/destinations/:id", async (req, res) => {
       try {
         const { id } = req.params;
 
-        if (!/^[a-fA-F0-9]{24}$/.test(id)) {
+        if (!isValidId(id)) {
           return res.status(400).json({
             message: "Invalid destination ID",
           });
@@ -304,11 +430,194 @@ async function startServer() {
           message: "Destination deleted successfully!",
         });
       } catch (error) {
-        console.error("Error deleting destination:", error);
+        return sendError(res, error, "Failed to delete destination");
+      }
+    });
 
-        return res.status(500).json({
-          message: "Failed to delete destination",
+    // GET bookings for the currently authenticated user.
+    app.get("/bookings", async (req, res) => {
+      try {
+        const authUser = await getAuthenticatedUser(req);
+
+        if (!authUser) {
+          return res.status(401).json({
+            message: "Please log in to view your bookings",
+          });
+        }
+
+        const user = await syncUser(authUser);
+
+        const bookings = await bookingsCollection
+          .find({ userId: String(authUser.id) })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        return res.status(200).json({
+          user,
+          bookings,
         });
+      } catch (error) {
+        return sendError(res, error, "Failed to fetch bookings");
+      }
+    });
+
+    // CREATE booking for the currently authenticated user.
+    app.post("/bookings", async (req, res) => {
+      try {
+        const authUser = await getAuthenticatedUser(req);
+
+        if (!authUser) {
+          return res.status(401).json({
+            message: "Please log in to book a destination",
+          });
+        }
+
+        const { destinationId, departure } = req.body;
+
+        if (!isValidId(destinationId)) {
+          return res.status(400).json({
+            message: "Invalid destination ID",
+          });
+        }
+
+        if (
+          typeof departure !== "string" ||
+          !/^\d{4}-\d{2}-\d{2}$/.test(departure)
+        ) {
+          return res.status(400).json({
+            message: "A valid departure date is required",
+          });
+        }
+
+        const user = await syncUser(authUser);
+
+        const destination = await destinationsCollection.findOne({
+          _id: new ObjectId(destinationId),
+        });
+
+        if (!destination) {
+          return res.status(404).json({
+            message: "Destination not found",
+          });
+        }
+
+        const existingBooking = await bookingsCollection.findOne({
+          userId: String(authUser.id),
+          destinationId: String(destination._id),
+          status: { $ne: "Cancelled" },
+        });
+
+        if (existingBooking) {
+          return res.status(409).json({
+            message: "You have already booked this destination",
+          });
+        }
+
+        const now = new Date();
+
+        const booking = {
+          userId: String(authUser.id),
+          email: user.email,
+          destinationId: String(destination._id),
+          title: destination.destinationName,
+          image: destination.imageUrl || "",
+          departure,
+          bookingId: `WB-${Date.now()}-${new ObjectId().toString().slice(-6)}`,
+          price: Number(destination.price),
+          status: "Pending",
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        const result = await bookingsCollection.insertOne(booking);
+
+        return res.status(201).json({
+          message: "Booking saved successfully!",
+          booking: {
+            _id: result.insertedId,
+            ...booking,
+          },
+        });
+      } catch (error) {
+        return sendError(res, error, "Failed to create booking");
+      }
+    });
+
+    // UPDATE booking status for the authenticated booking owner.
+    app.patch("/bookings/:id", async (req, res) => {
+      try {
+        const authUser = await getAuthenticatedUser(req);
+
+        if (!authUser) {
+          return res.status(401).json({
+            message: "Please log in to update your booking",
+          });
+        }
+
+        const { id } = req.params;
+        const { status } = req.body;
+
+        if (!isValidId(id)) {
+          return res.status(400).json({
+            message: "Invalid booking ID",
+          });
+        }
+
+        if (!["Pending", "Confirmed", "Cancelled"].includes(status)) {
+          return res.status(400).json({
+            message: "Invalid booking status",
+          });
+        }
+
+        const result = await bookingsCollection.updateOne(
+          {
+            _id: new ObjectId(id),
+            userId: String(authUser.id),
+          },
+          {
+            $set: {
+              status,
+              updatedAt: new Date(),
+            },
+          },
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({
+            message: "Booking not found",
+          });
+        }
+
+        const booking = await bookingsCollection.findOne({
+          _id: new ObjectId(id),
+          userId: String(authUser.id),
+        });
+
+        return res.status(200).json({
+          message: "Booking updated successfully!",
+          booking,
+        });
+      } catch (error) {
+        return sendError(res, error, "Failed to update booking");
+      }
+    });
+
+    // GET the currently authenticated user's saved profile.
+    app.get("/users/me", async (req, res) => {
+      try {
+        const authUser = await getAuthenticatedUser(req);
+
+        if (!authUser) {
+          return res.status(401).json({
+            message: "Please log in to view your profile",
+          });
+        }
+
+        const user = await syncUser(authUser);
+
+        return res.status(200).json(user);
+      } catch (error) {
+        return sendError(res, error, "Failed to fetch user profile");
       }
     });
 
