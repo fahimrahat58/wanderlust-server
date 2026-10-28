@@ -773,7 +773,7 @@ async function startServer() {
 
         return res.status(200).json({
           ...user,
-          isAdmin: req.user.email === ADMIN_EMAIL,
+         isAdmin: req.user.email?.trim().toLowerCase() === ADMIN_EMAIL,
         });
       } catch (error) {
         return sendError(res, error, "Failed to fetch user profile");
