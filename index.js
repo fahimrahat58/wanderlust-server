@@ -12,12 +12,10 @@ const PORT = Number(process.env.PORT) || 5000;
 const MONGODB_URI = process.env.MONGODB_URI;
 
 const AUTH_BASE_URL = (
-  process.env.BETTER_AUTH_URL ||
-  process.env.AUTH_BASE_URL ||
-  "http://localhost:3000"
+  process.env.BETTER_AUTH_URL || process.env.AUTH_BASE_URL
 ).replace(/\/$/, "");
 
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+const FRONTEND_URL = process.env.FRONTEND_URL;
 
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL?.trim().toLowerCase();
 
