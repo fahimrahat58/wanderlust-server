@@ -1,16 +1,24 @@
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { MongoClient, ObjectId } from "mongodb";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import "dotenv/config";
 
 const app = express();
-const PORT = process.env.PORT || 5000;
 
+const PORT = Number(process.env.PORT) || 5000;
 const MONGODB_URI = process.env.MONGODB_URI;
-const AUTH_BASE_URL =
-  process.env.AUTH_BASE_URL || "http://localhost:3000";
-const FRONTEND_URL =
-  process.env.FRONTEND_URL || "http://localhost:3000";
+
+const AUTH_BASE_URL = (
+  process.env.BETTER_AUTH_URL ||
+  process.env.AUTH_BASE_URL ||
+  "http://localhost:3000"
+).replace(/\/$/, "");
+
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL?.trim().toLowerCase();
 
 if (!MONGODB_URI) {
@@ -21,86 +29,209 @@ if (!ADMIN_EMAIL) {
   throw new Error("ADMIN_EMAIL is missing from .env");
 }
 
+const client = new MongoClient(MONGODB_URI);
+
+const JWKS = createRemoteJWKSet(new URL("/api/auth/jwks", `${AUTH_BASE_URL}/`));
+
+app.use(helmet());
+
 app.use(
   cors({
     origin: FRONTEND_URL,
     credentials: true,
+    methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Accept"],
   }),
 );
 
 app.use(express.json({ limit: "1mb" }));
 
-const client = new MongoClient(MONGODB_URI);
+app.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 300,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    skip: (req) => req.method === "OPTIONS",
+  }),
+);
 
-let usersCollection;
-let destinationsCollection;
-let bookingsCollection;
-
-const isValidObjectId = (id) =>
-  typeof id === "string" && /^[a-fA-F0-9]{24}$/.test(id);
-
-const toObjectId = (id) => new ObjectId(id);
-
-function sendError(res, status, message) {
-  return res.status(status).json({ message });
+function isValidId(id) {
+  return typeof id === "string" && /^[a-fA-F0-9]{24}$/.test(id);
 }
 
-function getString(value) {
-  return typeof value === "string" ? value.trim() : "";
+function sendError(res, error, message) {
+  console.error("[API ERROR]", message, error);
+
+  return res.status(500).json({
+    success: false,
+    message,
+  });
 }
 
-function isValidDate(value) {
-  if (
-    typeof value !== "string" ||
-    !/^\d{4}-\d{2}-\d{2}$/.test(value)
-  ) {
-    return false;
-  }
+/* ==========================================
+   JWT AUTHENTICATION
+========================================== */
 
-  const date = new Date(`${value}T00:00:00.000Z`);
+async function getAuthenticatedJwtUser(req) {
+  console.log("\n========== JWT VERIFICATION ==========");
+  console.log("[JWT] Method:", req.method);
+  console.log("[JWT] Route:", req.originalUrl);
 
-  return (
-    !Number.isNaN(date.getTime()) &&
-    date.toISOString().slice(0, 10) === value
+  const authorization = req.headers.authorization;
+
+  console.log("[JWT] Authorization header present:", Boolean(authorization));
+
+  console.log(
+    "[JWT] Bearer token present:",
+    Boolean(authorization?.startsWith("Bearer ")),
   );
-}
 
-function isValidHttpUrl(value) {
-  if (typeof value !== "string" || !value.trim()) {
-    return false;
+  if (!authorization?.startsWith("Bearer ")) {
+    console.warn("[JWT] FAILED: Bearer token missing");
+    console.log("======================================\n");
+    return null;
   }
+
+  const token = authorization.slice(7).trim();
+
+  if (!token) {
+    console.warn("[JWT] FAILED: Empty token");
+    console.log("======================================\n");
+    return null;
+  }
+
+  console.log("[JWT] Token received. Token value hidden.");
+  console.log("[JWT] Verifying signature, issuer and audience...");
 
   try {
-    const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
+    const { payload } = await jwtVerify(token, JWKS, {
+      issuer: AUTH_BASE_URL,
+      audience: AUTH_BASE_URL,
+    });
+
+    console.log("[JWT] Signature and claims verified");
+    console.log("[JWT] Issuer:", payload.iss);
+    console.log("[JWT] Audience:", payload.aud);
+    console.log("[JWT] Subject exists:", Boolean(payload.sub));
+    console.log("[JWT] Email exists:", Boolean(payload.email));
+
+    if (!payload.sub || !payload.email) {
+      console.error("[JWT] FAILED: Required claims missing");
+      console.log("======================================\n");
+      return null;
+    }
+
+    const user = {
+      id: String(payload.sub),
+      email: String(payload.email).trim().toLowerCase(),
+      name: typeof payload.name === "string" ? payload.name : "",
+    };
+
+    console.log("[JWT] VERIFIED SUCCESSFULLY");
+    console.log("[JWT] User ID:", user.id);
+    console.log("[JWT] User email:", user.email);
+    console.log("[JWT] Token value was not printed");
+    console.log("======================================\n");
+
+    return user;
+  } catch (error) {
+    console.error("[JWT] VERIFICATION FAILED");
+    console.error("[JWT] Error name:", error.name);
+    console.error("[JWT] Error message:", error.message);
+    console.log("======================================\n");
+
+    return null;
   }
 }
 
-/* ---------------- AUTHENTICATION ---------------- */
+async function requireJwtAuth(req, res, next) {
+  console.log("\n========== JWT MIDDLEWARE ==========");
+  console.log("[JWT MIDDLEWARE] Checking:", req.method, req.originalUrl);
+
+  try {
+    const user = await getAuthenticatedJwtUser(req);
+
+    if (!user) {
+      console.error("[JWT MIDDLEWARE] DENIED");
+      console.log("[JWT MIDDLEWARE] HTTP 401");
+      console.log("====================================\n");
+
+      return res.status(401).json({
+        success: false,
+        message: "Valid Bearer JWT token required",
+      });
+    }
+
+    req.user = user;
+
+    console.log("[JWT MIDDLEWARE] AUTHENTICATED");
+    console.log("[JWT MIDDLEWARE] User:", user.email);
+    console.log("[JWT MIDDLEWARE] Passing to next middleware");
+    console.log("====================================\n");
+
+    return next();
+  } catch (error) {
+    console.error("[JWT MIDDLEWARE] ERROR:", error.message);
+
+    return res.status(401).json({
+      success: false,
+      message: "Authentication failed",
+    });
+  }
+}
+
+/* ==========================================
+   BETTER AUTH SESSION SUPPORT
+   Used for regular user endpoints
+========================================== */
 
 async function getAuthenticatedUser(req) {
+  console.log("\n========== USER AUTHENTICATION ==========");
+  console.log("[AUTH] Route:", req.method, req.originalUrl);
+
+  // Prefer a verified Bearer JWT when one is provided.
+  const authorization = req.headers.authorization;
+
+  if (authorization?.startsWith("Bearer ")) {
+    console.log("[AUTH] Bearer JWT supplied; verifying JWT");
+
+    const jwtUser = await getAuthenticatedJwtUser(req);
+
+    if (jwtUser) {
+      console.log("[AUTH] Authenticated using JWT:", jwtUser.email);
+      console.log("=========================================\n");
+      return jwtUser;
+    }
+
+    console.warn("[AUTH] JWT invalid; checking session cookie if available");
+  }
+
   const cookie = req.headers.cookie;
 
+  console.log("[AUTH] Session cookie present:", Boolean(cookie));
+
   if (!cookie) {
+    console.warn("[AUTH] No valid JWT or session cookie");
+    console.log("=========================================\n");
     return null;
   }
 
   try {
-    const response = await fetch(
-      `${AUTH_BASE_URL.replace(/\/$/, "")}/api/auth/get-session`,
-      {
-        method: "GET",
-        headers: {
-          cookie,
-          accept: "application/json",
-        },
-        cache: "no-store",
+    const response = await fetch(`${AUTH_BASE_URL}/api/auth/get-session`, {
+      method: "GET",
+      headers: {
+        cookie,
+        accept: "application/json",
       },
-    );
+      cache: "no-store",
+    });
+
+    console.log("[AUTH] Better Auth session HTTP status:", response.status);
 
     if (!response.ok) {
+      console.warn("[AUTH] Session verification failed");
+      console.log("=========================================\n");
       return null;
     }
 
@@ -108,803 +239,121 @@ async function getAuthenticatedUser(req) {
     const user = data?.user;
 
     if (!user?.id || !user?.email) {
+      console.warn("[AUTH] Session has no valid user");
+      console.log("=========================================\n");
       return null;
     }
 
-    return user;
+    const authenticatedUser = {
+      ...user,
+      id: String(user.id),
+      email: String(user.email).trim().toLowerCase(),
+    };
+
+    console.log("[AUTH] SESSION VERIFIED");
+    console.log("[AUTH] User:", authenticatedUser.email);
+    console.log("=========================================\n");
+
+    return authenticatedUser;
   } catch (error) {
-    console.error("Better Auth session verification failed:", error);
+    console.error("[AUTH] Session verification error:", error.message);
+    console.log("=========================================\n");
     return null;
   }
 }
 
-/* ---------------- USER SYNC ---------------- */
-
-async function syncUser(authUser) {
-  const now = new Date();
-  const email = authUser.email.trim().toLowerCase();
-  const authUserId = String(authUser.id);
-  const role = email === ADMIN_EMAIL ? "admin" : "user";
-
-  const existingUser = await usersCollection.findOne({
-    authUserId,
-  });
-
-  if (existingUser) {
-    // Keep the saved profile name and other profile fields.
-    // Only sync the verified email and server-derived role.
-    await usersCollection.updateOne(
-      { authUserId },
-      {
-        $set: {
-          email,
-          role,
-          updatedAt: now,
-        },
-      },
-    );
-  } else {
-    await usersCollection.updateOne(
-      { authUserId },
-      {
-        $setOnInsert: {
-          authUserId,
-          name: getString(authUser.name),
-          email,
-          role,
-          profileImage: "",
-          nationality: "",
-          createdAt: authUser.createdAt
-            ? new Date(authUser.createdAt)
-            : now,
-          updatedAt: now,
-        },
-      },
-      { upsert: true },
-    );
-  }
-
-  return usersCollection.findOne({ authUserId });
-}
-
-/* ---------------- AUTH HELPERS ---------------- */
-
-async function requireAuth(req, res) {
-  const authUser = await getAuthenticatedUser(req);
-
-  if (!authUser) {
-    sendError(res, 401, "Please sign in first.");
-    return null;
-  }
+async function requireAuth(req, res, next) {
+  console.log("[AUTH MIDDLEWARE] Checking user session or JWT");
 
   try {
-    const user = await syncUser(authUser);
+    const user = await getAuthenticatedUser(req);
 
     if (!user) {
-      sendError(res, 401, "Unable to verify user.");
-      return null;
-    }
+      console.warn("[AUTH MIDDLEWARE] DENIED: Not authenticated");
 
-    req.authUser = authUser;
-    req.dbUser = user;
-
-    return user;
-  } catch (error) {
-    console.error("User synchronization failed:", error);
-    sendError(res, 500, "Failed to verify user.");
-    return null;
-  }
-}
-
-async function requireAdmin(req, res) {
-  const user = await requireAuth(req, res);
-
-  if (!user) {
-    return null;
-  }
-
-  if (user.role !== "admin") {
-    sendError(res, 403, "Admin access required.");
-    return null;
-  }
-
-  return user;
-}
-
-/* ---------------- DESTINATION VALIDATION ---------------- */
-
-function validateDestination(body, partial = false) {
-  const errors = [];
-
-  const requiredFields = [
-    "destinationName",
-    "country",
-    "category",
-    "price",
-    "duration",
-    "departureDate",
-    "imageUrl",
-    "description",
-  ];
-
-  if (!partial) {
-    for (const field of requiredFields) {
-      if (body[field] === undefined || body[field] === null) {
-        errors.push(`${field} is required.`);
-      }
-    }
-  }
-
-  const stringFields = [
-    "destinationName",
-    "country",
-    "category",
-    "duration",
-    "departureDate",
-    "imageUrl",
-    "description",
-  ];
-
-  for (const field of stringFields) {
-    if (body[field] === undefined) continue;
-
-    if (typeof body[field] !== "string") {
-      errors.push(`${field} must be a string.`);
-      continue;
-    }
-
-    if (
-      !partial &&
-      field !== "description" &&
-      !body[field].trim()
-    ) {
-      errors.push(`${field} cannot be empty.`);
-    }
-  }
-
-  if (body.price !== undefined) {
-    const price = Number(body.price);
-
-    if (!Number.isFinite(price) || price < 0) {
-      errors.push("Price must be a valid non-negative number.");
-    }
-  }
-
-  if (body.rating !== undefined) {
-    const rating = Number(body.rating);
-
-    if (!Number.isFinite(rating) || rating < 0 || rating > 5) {
-      errors.push("Rating must be between 0 and 5.");
-    }
-  }
-
-  if (
-    body.departureDate !== undefined &&
-    !isValidDate(body.departureDate)
-  ) {
-    errors.push("Departure date must use YYYY-MM-DD format.");
-  }
-
-  if (
-    body.imageUrl !== undefined &&
-    body.imageUrl.trim() &&
-    !isValidHttpUrl(body.imageUrl)
-  ) {
-    errors.push("Image URL must be a valid HTTP or HTTPS URL.");
-  }
-
-  return errors;
-}
-
-function buildDestination(body, existing = {}) {
-  const destination = { ...existing };
-
-  const stringFields = [
-    "destinationName",
-    "country",
-    "category",
-    "duration",
-    "departureDate",
-    "imageUrl",
-    "description",
-  ];
-
-  for (const field of stringFields) {
-    if (body[field] !== undefined) {
-      destination[field] = body[field].trim();
-    }
-  }
-
-  if (body.price !== undefined) {
-    destination.price = Number(body.price);
-  }
-
-  if (body.rating !== undefined) {
-    destination.rating = Number(body.rating);
-  }
-
-  return destination;
-}
-
-/* ---------------- HEALTH CHECK ---------------- */
-
-app.get("/", (req, res) => {
-  res.json({
-    message: "Wanderlust API is running.",
-    status: "ok",
-  });
-});
-
-/* ---------------- DESTINATIONS ---------------- */
-
-// Get all destinations
-app.get("/destinations", async (req, res) => {
-  try {
-    const destinations = await destinationsCollection
-      .find({})
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    res.json(destinations);
-  } catch (error) {
-    console.error("Get destinations error:", error);
-    sendError(res, 500, "Failed to fetch destinations.");
-  }
-});
-
-// Get a single destination
-app.get("/destinations/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (!isValidObjectId(id)) {
-      return sendError(res, 400, "Invalid destination ID.");
-    }
-
-    const destination = await destinationsCollection.findOne({
-      _id: toObjectId(id),
-    });
-
-    if (!destination) {
-      return sendError(res, 404, "Destination not found.");
-    }
-
-    res.json(destination);
-  } catch (error) {
-    console.error("Get destination error:", error);
-    sendError(res, 500, "Failed to fetch destination.");
-  }
-});
-
-// Add destination - ADMIN ONLY
-app.post("/adddestinations", async (req, res) => {
-  try {
-    const admin = await requireAdmin(req, res);
-    if (!admin) return;
-
-    const errors = validateDestination(req.body);
-
-    if (errors.length) {
-      return res.status(400).json({
-        message: "Invalid destination data.",
-        errors,
+      return res.status(401).json({
+        success: false,
+        message: "Please log in to continue",
       });
     }
 
-    const now = new Date();
+    req.user = user;
 
-    const destination = {
-      ...buildDestination(req.body),
-      rating:
-        req.body.rating === undefined ? 0 : Number(req.body.rating),
-      createdAt: now,
-      updatedAt: now,
-      createdBy: admin.authUserId,
-    };
+    console.log("[AUTH MIDDLEWARE] AUTHENTICATED:", user.email);
 
-    const result = await destinationsCollection.insertOne(destination);
-
-    res.status(201).json({
-      message: "Destination added successfully.",
-      destination: {
-        ...destination,
-        _id: result.insertedId,
-      },
-    });
+    return next();
   } catch (error) {
-    console.error("Add destination error:", error);
-    sendError(res, 500, "Failed to add destination.");
+    console.error("[AUTH MIDDLEWARE] ERROR:", error.message);
+
+    return res.status(401).json({
+      success: false,
+      message: "Authentication failed",
+    });
   }
-});
+}
 
-// Update destination - ADMIN ONLY
-app.patch("/destinations/:id", async (req, res) => {
-  try {
-    const admin = await requireAdmin(req, res);
-    if (!admin) return;
+/* ==========================================
+   ADMIN AUTHORIZATION
+========================================== */
 
-    const { id } = req.params;
+function requireAdmin(req, res, next) {
+  console.log("\n========== ADMIN AUTHORIZATION ==========");
+  console.log("[ADMIN] Route:", req.method, req.originalUrl);
+  console.log("[ADMIN] Authenticated user:", req.user?.email);
+  console.log("[ADMIN] Admin configuration exists:", Boolean(ADMIN_EMAIL));
 
-    if (!isValidObjectId(id)) {
-      return sendError(res, 400, "Invalid destination ID.");
-    }
+  if (!req.user?.email) {
+    console.error("[ADMIN] DENIED: No authenticated user");
+    console.log("[ADMIN] HTTP 401");
+    console.log("=========================================\n");
 
-    const errors = validateDestination(req.body, true);
-
-    if (errors.length) {
-      return res.status(400).json({
-        message: "Invalid destination data.",
-        errors,
-      });
-    }
-
-    const destinationId = toObjectId(id);
-
-    const existing = await destinationsCollection.findOne({
-      _id: destinationId,
+    return res.status(401).json({
+      success: false,
+      message: "Authentication required",
     });
-
-    if (!existing) {
-      return sendError(res, 404, "Destination not found.");
-    }
-
-    const updatedDestination = buildDestination(req.body, existing);
-    updatedDestination.updatedAt = new Date();
-
-    await destinationsCollection.updateOne(
-      { _id: destinationId },
-      { $set: updatedDestination },
-    );
-
-    const destination = await destinationsCollection.findOne({
-      _id: destinationId,
-    });
-
-    res.json({
-      message: "Destination updated successfully.",
-      destination,
-    });
-  } catch (error) {
-    console.error("Update destination error:", error);
-    sendError(res, 500, "Failed to update destination.");
-  }
-});
-
-// Delete destination - ADMIN ONLY
-app.delete("/destinations/:id", async (req, res) => {
-  try {
-    const admin = await requireAdmin(req, res);
-    if (!admin) return;
-
-    const { id } = req.params;
-
-    if (!isValidObjectId(id)) {
-      return sendError(res, 400, "Invalid destination ID.");
-    }
-
-    const result = await destinationsCollection.deleteOne({
-      _id: toObjectId(id),
-    });
-
-    if (!result.deletedCount) {
-      return sendError(res, 404, "Destination not found.");
-    }
-
-    res.json({
-      message: "Destination deleted successfully.",
-    });
-  } catch (error) {
-    console.error("Delete destination error:", error);
-    sendError(res, 500, "Failed to delete destination.");
-  }
-});
-
-/* ---------------- USER PROFILE ---------------- */
-
-// Get current user's profile
-app.get("/users/me", async (req, res) => {
-  try {
-    const user = await requireAuth(req, res);
-    if (!user) return;
-
-    res.json({ user });
-  } catch (error) {
-    console.error("Get profile error:", error);
-    sendError(res, 500, "Failed to fetch profile.");
-  }
-});
-
-// Update current user's profile
-app.patch("/users/me", async (req, res) => {
-  try {
-    const user = await requireAuth(req, res);
-    if (!user) return;
-
-    const { name, profileImage, nationality } = req.body;
-    const updates = {};
-
-    if (name !== undefined) {
-      if (
-        typeof name !== "string" ||
-        !name.trim() ||
-        name.trim().length > 100
-      ) {
-        return sendError(
-          res,
-          400,
-          "Name must be between 1 and 100 characters.",
-        );
-      }
-
-      updates.name = name.trim();
-    }
-
-    if (profileImage !== undefined) {
-      if (
-        typeof profileImage !== "string" ||
-        profileImage.length > 2048
-      ) {
-        return sendError(res, 400, "Invalid profile image URL.");
-      }
-
-      const image = profileImage.trim();
-
-      if (image && !isValidHttpUrl(image)) {
-        return sendError(
-          res,
-          400,
-          "Profile image must be a valid HTTP or HTTPS URL.",
-        );
-      }
-
-      updates.profileImage = image;
-    }
-
-    if (nationality !== undefined) {
-      if (
-        typeof nationality !== "string" ||
-        nationality.trim().length > 80
-      ) {
-        return sendError(res, 400, "Invalid nationality.");
-      }
-
-      updates.nationality = nationality.trim();
-    }
-
-    if (Object.keys(updates).length === 0) {
-      return sendError(res, 400, "No valid profile fields provided.");
-    }
-
-    updates.updatedAt = new Date();
-
-    await usersCollection.updateOne(
-      { authUserId: user.authUserId },
-      { $set: updates },
-    );
-
-    const updatedUser = await usersCollection.findOne({
-      authUserId: user.authUserId,
-    });
-
-    res.json({
-      message: "Profile updated successfully.",
-      user: updatedUser,
-    });
-  } catch (error) {
-    console.error("Update profile error:", error);
-    sendError(res, 500, "Failed to update profile.");
-  }
-});
-
-/* ---------------- USER BOOKINGS ---------------- */
-
-// Get current user's bookings
-app.get("/bookings", async (req, res) => {
-  try {
-    const user = await requireAuth(req, res);
-    if (!user) return;
-
-    const bookings = await bookingsCollection
-      .find({ userId: user.authUserId })
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    res.json({
-      user: {
-        id: user.authUserId,
-        name: user.name,
-        email: user.email,
-      },
-      bookings,
-    });
-  } catch (error) {
-    console.error("Get bookings error:", error);
-    sendError(res, 500, "Failed to fetch bookings.");
-  }
-});
-
-// Create a booking for the logged-in user
-app.post("/bookings", async (req, res) => {
-  try {
-    const user = await requireAuth(req, res);
-    if (!user) return;
-
-    const destinationId = getString(req.body.destinationId);
-    const departure = getString(req.body.departure);
-
-    if (!isValidObjectId(destinationId)) {
-      return sendError(res, 400, "Invalid destination ID.");
-    }
-
-    if (departure && !isValidDate(departure)) {
-      return sendError(
-        res,
-        400,
-        "Departure date must use YYYY-MM-DD format.",
-      );
-    }
-
-    const destination = await destinationsCollection.findOne({
-      _id: toObjectId(destinationId),
-    });
-
-    if (!destination) {
-      return sendError(res, 404, "Destination not found.");
-    }
-
-    const existingBooking = await bookingsCollection.findOne({
-      userId: user.authUserId,
-      destinationId,
-      status: { $nin: ["Cancelled", "Rejected"] },
-    });
-
-    if (existingBooking) {
-      return sendError(
-        res,
-        409,
-        "You already have an active booking for this destination.",
-      );
-    }
-
-    const now = new Date();
-
-    const booking = {
-      userId: user.authUserId,
-      userEmail: user.email,
-      userName: user.name || "",
-      destinationId,
-      destinationName: destination.destinationName,
-      country: destination.country || "",
-      imageUrl: destination.imageUrl || "",
-      price: Number(destination.price) || 0,
-      departure: departure || destination.departureDate || "",
-      duration: destination.duration || "",
-      status: "Pending",
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    const result = await bookingsCollection.insertOne(booking);
-
-    res.status(201).json({
-      message: "Booking created successfully.",
-      booking: {
-        ...booking,
-        _id: result.insertedId,
-      },
-    });
-  } catch (error) {
-    console.error("Create booking error:", error);
-    sendError(res, 500, "Failed to create booking.");
-  }
-});
-
-// Cancel own booking
-app.patch("/bookings/:id", async (req, res) => {
-  try {
-    const user = await requireAuth(req, res);
-    if (!user) return;
-
-    const { id } = req.params;
-
-    if (!isValidObjectId(id)) {
-      return sendError(res, 400, "Invalid booking ID.");
-    }
-
-    const bookingId = toObjectId(id);
-
-    const booking = await bookingsCollection.findOne({
-      _id: bookingId,
-      userId: user.authUserId,
-    });
-
-    if (!booking) {
-      return sendError(res, 404, "Booking not found.");
-    }
-
-    if (booking.status === "Cancelled") {
-      return sendError(res, 400, "Booking is already cancelled.");
-    }
-
-    await bookingsCollection.updateOne(
-      {
-        _id: bookingId,
-        userId: user.authUserId,
-      },
-      {
-        $set: {
-          status: "Cancelled",
-          updatedAt: new Date(),
-        },
-      },
-    );
-
-    const updatedBooking = await bookingsCollection.findOne({
-      _id: bookingId,
-    });
-
-    res.json({
-      message: "Booking cancelled successfully.",
-      booking: updatedBooking,
-    });
-  } catch (error) {
-    console.error("Cancel booking error:", error);
-    sendError(res, 500, "Failed to cancel booking.");
-  }
-});
-
-/* ---------------- ADMIN BOOKINGS ---------------- */
-
-// Get all bookings - ADMIN ONLY
-app.get("/admin/bookings", async (req, res) => {
-  try {
-    const admin = await requireAdmin(req, res);
-    if (!admin) return;
-
-    const bookings = await bookingsCollection
-      .find({})
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    res.json(bookings);
-  } catch (error) {
-    console.error("Admin get bookings error:", error);
-    sendError(res, 500, "Failed to fetch all bookings.");
-  }
-});
-
-// Update booking status - ADMIN ONLY
-app.patch("/admin/bookings/:id", async (req, res) => {
-  try {
-    const admin = await requireAdmin(req, res);
-    if (!admin) return;
-
-    const { id } = req.params;
-    const status = getString(req.body.status);
-
-    const allowedStatuses = [
-      "Pending",
-      "Confirmed",
-      "Cancelled",
-      "Rejected",
-      "Completed",
-    ];
-
-    if (!isValidObjectId(id)) {
-      return sendError(res, 400, "Invalid booking ID.");
-    }
-
-    if (!allowedStatuses.includes(status)) {
-      return sendError(res, 400, "Invalid booking status.");
-    }
-
-    const bookingId = toObjectId(id);
-
-    const result = await bookingsCollection.updateOne(
-      { _id: bookingId },
-      {
-        $set: {
-          status,
-          updatedAt: new Date(),
-          updatedBy: admin.authUserId,
-        },
-      },
-    );
-
-    if (!result.matchedCount) {
-      return sendError(res, 404, "Booking not found.");
-    }
-
-    const booking = await bookingsCollection.findOne({
-      _id: bookingId,
-    });
-
-    res.json({
-      message: "Booking status updated successfully.",
-      booking,
-    });
-  } catch (error) {
-    console.error("Admin update booking error:", error);
-    sendError(res, 500, "Failed to update booking.");
-  }
-});
-
-/* ---------------- ADMIN USERS ---------------- */
-
-// Get users - ADMIN ONLY
-app.get("/admin/users", async (req, res) => {
-  try {
-    const admin = await requireAdmin(req, res);
-    if (!admin) return;
-
-    const users = await usersCollection
-      .find(
-        {},
-        {
-          projection: {
-            authUserId: 1,
-            name: 1,
-            email: 1,
-            role: 1,
-            profileImage: 1,
-            nationality: 1,
-            createdAt: 1,
-            updatedAt: 1,
-          },
-        },
-      )
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    res.json(users);
-  } catch (error) {
-    console.error("Admin get users error:", error);
-    sendError(res, 500, "Failed to fetch users.");
-  }
-});
-
-/* ---------------- 404 HANDLER ---------------- */
-
-app.use((req, res) => {
-  res.status(404).json({
-    message: "API route not found.",
-    path: req.originalUrl,
-  });
-});
-
-/* ---------------- ERROR HANDLER ---------------- */
-
-app.use((error, req, res, next) => {
-  console.error("Unhandled server error:", error);
-
-  if (res.headersSent) {
-    return next(error);
   }
 
-  res.status(500).json({
-    message: "Internal server error.",
-  });
-});
+  if (req.user.email.trim().toLowerCase() !== ADMIN_EMAIL) {
+    console.error("[ADMIN] DENIED: User is not an admin");
+    console.log("[ADMIN] HTTP 403");
+    console.log("=========================================\n");
 
-/* ---------------- START SERVER ---------------- */
+    return res.status(403).json({
+      success: false,
+      message: "Admin access required",
+    });
+  }
+
+  console.log("[ADMIN] ACCESS GRANTED");
+  console.log("[ADMIN] Admin:", req.user.email);
+  console.log("=========================================\n");
+
+  return next();
+}
+
+function logProtectedRoute(req, res, next) {
+  console.log("\n========== PROTECTED ROUTE ==========");
+  console.log("[ROUTE] Access granted:", req.method, req.originalUrl);
+  console.log("[ROUTE] User:", req.user?.email);
+  console.log("[ROUTE] User ID:", req.user?.id);
+  console.log("=====================================\n");
+
+  next();
+}
+
+/* ==========================================
+   START SERVER
+========================================== */
 
 async function startServer() {
   try {
     await client.connect();
 
-    const database = client.db("wanderlust");
+    const db = client.db("wanderlust");
 
-    usersCollection = database.collection("users");
-    destinationsCollection = database.collection("destinations");
-    bookingsCollection = database.collection("bookings");
-
-    // IMPORTANT:
-    // Existing authUserId_1 index is unique without sparse.
-    // Use the same options to avoid IndexKeySpecsConflict.
-    await usersCollection.createIndex(
-      { authUserId: 1 },
-      { unique: true },
-    );
+    const usersCollection = db.collection("users");
+    const destinationsCollection = db.collection("destinations");
+    const bookingsCollection = db.collection("bookings");
 
     await bookingsCollection.createIndex({
       userId: 1,
@@ -912,37 +361,800 @@ async function startServer() {
     });
 
     await bookingsCollection.createIndex({
-      destinationId: 1,
       userId: 1,
+      destinationId: 1,
+    });
+
+    console.log("[DB] MongoDB connected successfully");
+    console.log("[SERVER] Admin email configured:", ADMIN_EMAIL);
+    console.log("[SERVER] Better Auth URL:", AUTH_BASE_URL);
+
+    async function syncUser(authUser) {
+      const now = new Date();
+      const authUserId = String(authUser.id);
+
+      await usersCollection.updateOne(
+        { authUserId },
+        {
+          $set: {
+            email: String(authUser.email).trim().toLowerCase(),
+            updatedAt: now,
+          },
+          $setOnInsert: {
+            authUserId,
+            name: authUser.name || "",
+            createdAt: authUser.createdAt ? new Date(authUser.createdAt) : now,
+          },
+        },
+        { upsert: true },
+      );
+
+      return usersCollection.findOne({ authUserId });
+    }
+
+    /* ---------- HEALTH CHECK ---------- */
+
+    app.get("/", (req, res) => {
+      console.log("[PUBLIC] Health check requested");
+
+      return res.status(200).json({
+        success: true,
+        message: "Wanderlust API is running",
+      });
+    });
+
+    /* ---------- GET ALL DESTINATIONS ---------- */
+
+    app.get("/destinations", async (req, res) => {
+      console.log("[PUBLIC] GET /destinations");
+
+      try {
+        const destinations = await destinationsCollection
+          .find({})
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        return res.status(200).json(destinations);
+      } catch (error) {
+        return sendError(res, error, "Failed to fetch destinations");
+      }
+    });
+
+    /* ---------- GET DESTINATION DETAILS ---------- */
+
+    app.get("/destinations/:id", async (req, res) => {
+      console.log("[PUBLIC] GET /destinations/:id", req.params.id);
+
+      try {
+        const { id } = req.params;
+
+        if (!isValidId(id)) {
+          return res.status(400).json({
+            message: "Invalid destination ID",
+          });
+        }
+
+        const destination = await destinationsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!destination) {
+          return res.status(404).json({
+            message: "Destination not found",
+          });
+        }
+
+        return res.status(200).json(destination);
+      } catch (error) {
+        return sendError(res, error, "Failed to fetch destination details");
+      }
+    });
+
+    /* ---------- ADD DESTINATION: JWT + ADMIN ---------- */
+
+    app.post(
+      "/adddestinations",
+      requireJwtAuth,
+      requireAdmin,
+      logProtectedRoute,
+      async (req, res) => {
+        console.log("[DESTINATION] Creating destination");
+
+        try {
+          const {
+            destinationName,
+            country,
+            category,
+            price,
+            duration,
+            departureDate,
+            imageUrl,
+            description,
+          } = req.body;
+
+          if (
+            typeof destinationName !== "string" ||
+            !destinationName.trim() ||
+            typeof country !== "string" ||
+            !country.trim() ||
+            price === undefined ||
+            price === null ||
+            price === ""
+          ) {
+            return res.status(400).json({
+              message: "Destination name, country, and price are required",
+            });
+          }
+
+          const numericPrice = Number(price);
+
+          if (!Number.isFinite(numericPrice) || numericPrice < 0) {
+            return res.status(400).json({
+              message: "Price must be a valid non-negative number",
+            });
+          }
+
+          const now = new Date();
+
+          const newDestination = {
+            destinationName: destinationName.trim(),
+            country: country.trim(),
+            category:
+              typeof category === "string" && category.trim()
+                ? category.trim()
+                : "Beach",
+            price: numericPrice,
+            duration: typeof duration === "string" ? duration.trim() : "",
+            departureDate:
+              typeof departureDate === "string" ? departureDate : "",
+            imageUrl:
+              typeof imageUrl === "string" && imageUrl.trim()
+                ? imageUrl.trim()
+                : "https://images.unsplash.com/photo-1537996194471-e657df975ab4",
+            description:
+              typeof description === "string" ? description.trim() : "",
+            rating: Number.isFinite(Number(req.body.rating))
+              ? Math.min(5, Math.max(0, Number(req.body.rating)))
+              : 4.5,
+            createdAt: now,
+            updatedAt: now,
+          };
+
+          const result = await destinationsCollection.insertOne(newDestination);
+
+          console.log(
+            "[DESTINATION] Created successfully:",
+            result.insertedId.toString(),
+          );
+
+          return res.status(201).json({
+            success: true,
+            message: "Destination created successfully!",
+            destination: {
+              _id: result.insertedId,
+              ...newDestination,
+            },
+          });
+        } catch (error) {
+          return sendError(res, error, "Failed to create travel package");
+        }
+      },
+    );
+
+    /* ---------- UPDATE DESTINATION: JWT + ADMIN ---------- */
+
+    app.patch(
+      "/destinations/:id",
+      requireJwtAuth,
+      requireAdmin,
+      logProtectedRoute,
+      async (req, res) => {
+        console.log("[DESTINATION] Updating:", req.params.id);
+
+        try {
+          const { id } = req.params;
+
+          if (!isValidId(id)) {
+            return res.status(400).json({
+              message: "Invalid destination ID",
+            });
+          }
+
+          const {
+            destinationName,
+            country,
+            category,
+            price,
+            duration,
+            departureDate,
+            imageUrl,
+            description,
+            rating,
+          } = req.body;
+
+          const updates = {};
+
+          if (destinationName !== undefined) {
+            if (
+              typeof destinationName !== "string" ||
+              !destinationName.trim()
+            ) {
+              return res.status(400).json({
+                message: "Destination name is required",
+              });
+            }
+
+            updates.destinationName = destinationName.trim();
+          }
+
+          if (country !== undefined) {
+            if (typeof country !== "string" || !country.trim()) {
+              return res.status(400).json({
+                message: "Country is required",
+              });
+            }
+
+            updates.country = country.trim();
+          }
+
+          if (category !== undefined) {
+            if (typeof category !== "string") {
+              return res.status(400).json({
+                message: "Category must be a string",
+              });
+            }
+
+            updates.category = category.trim();
+          }
+
+          if (price !== undefined) {
+            const numericPrice = Number(price);
+
+            if (
+              price === null ||
+              price === "" ||
+              !Number.isFinite(numericPrice) ||
+              numericPrice < 0
+            ) {
+              return res.status(400).json({
+                message: "Price must be a valid non-negative number",
+              });
+            }
+
+            updates.price = numericPrice;
+          }
+
+          if (duration !== undefined) {
+            if (typeof duration !== "string") {
+              return res.status(400).json({
+                message: "Duration must be a string",
+              });
+            }
+
+            updates.duration = duration.trim();
+          }
+
+          if (departureDate !== undefined) {
+            if (typeof departureDate !== "string") {
+              return res.status(400).json({
+                message: "Departure date must be a string",
+              });
+            }
+
+            updates.departureDate = departureDate;
+          }
+
+          if (imageUrl !== undefined) {
+            if (typeof imageUrl !== "string") {
+              return res.status(400).json({
+                message: "Image URL must be a string",
+              });
+            }
+
+            updates.imageUrl = imageUrl.trim();
+          }
+
+          if (description !== undefined) {
+            if (typeof description !== "string") {
+              return res.status(400).json({
+                message: "Description must be a string",
+              });
+            }
+
+            updates.description = description.trim();
+          }
+
+          if (rating !== undefined) {
+            const numericRating = Number(rating);
+
+            if (
+              rating === null ||
+              rating === "" ||
+              !Number.isFinite(numericRating) ||
+              numericRating < 0 ||
+              numericRating > 5
+            ) {
+              return res.status(400).json({
+                message: "Rating must be between 0 and 5",
+              });
+            }
+
+            updates.rating = numericRating;
+          }
+
+          if (Object.keys(updates).length === 0) {
+            return res.status(400).json({
+              message: "Please provide at least one field to update",
+            });
+          }
+
+          updates.updatedAt = new Date();
+
+          const result = await destinationsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: updates },
+          );
+
+          if (result.matchedCount === 0) {
+            return res.status(404).json({
+              message: "Destination not found",
+            });
+          }
+
+          const updatedDestination = await destinationsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          console.log("[DESTINATION] Updated successfully:", id);
+
+          return res.status(200).json({
+            success: true,
+            message: "Destination updated successfully!",
+            destination: updatedDestination,
+          });
+        } catch (error) {
+          return sendError(res, error, "Failed to update destination");
+        }
+      },
+    );
+
+    /* ---------- DELETE DESTINATION: JWT + ADMIN ---------- */
+
+    app.delete(
+      "/destinations/:id",
+      requireJwtAuth,
+      requireAdmin,
+      logProtectedRoute,
+      async (req, res) => {
+        console.log("[DESTINATION] Deleting:", req.params.id);
+
+        try {
+          const { id } = req.params;
+
+          if (!isValidId(id)) {
+            return res.status(400).json({
+              message: "Invalid destination ID",
+            });
+          }
+
+          const result = await destinationsCollection.deleteOne({
+            _id: new ObjectId(id),
+          });
+
+          if (result.deletedCount === 0) {
+            return res.status(404).json({
+              message: "Destination not found",
+            });
+          }
+
+          console.log("[DESTINATION] Deleted successfully:", id);
+
+          return res.status(200).json({
+            success: true,
+            message: "Destination deleted successfully!",
+          });
+        } catch (error) {
+          return sendError(res, error, "Failed to delete destination");
+        }
+      },
+    );
+
+    /* ---------- GET PROFILE: JWT ---------- */
+
+    app.get("/users/me", requireJwtAuth, async (req, res) => {
+      console.log("[PROFILE] Fetching profile:", req.user.email);
+
+      try {
+        const user = await syncUser(req.user);
+
+        if (!user) {
+          return res.status(404).json({
+            message: "User not found",
+          });
+        }
+
+        return res.status(200).json({
+          ...user,
+          isAdmin: req.user.email === ADMIN_EMAIL,
+        });
+      } catch (error) {
+        return sendError(res, error, "Failed to fetch user profile");
+      }
+    });
+
+    /* ---------- UPDATE PROFILE: JWT ---------- */
+
+    app.patch("/users/me", requireJwtAuth, async (req, res) => {
+      console.log("[PROFILE] Updating profile:", req.user.email);
+
+      try {
+        const { name, profileImage, nationality } = req.body;
+        const updates = { updatedAt: new Date() };
+
+        if (name !== undefined) {
+          if (typeof name !== "string" || !name.trim()) {
+            return res.status(400).json({
+              message: "Name must not be empty",
+            });
+          }
+
+          updates.name = name.trim();
+        }
+
+        if (profileImage !== undefined) {
+          if (typeof profileImage !== "string") {
+            return res.status(400).json({
+              message: "Profile image must be a string",
+            });
+          }
+
+          updates.profileImage = profileImage.trim();
+        }
+
+        if (nationality !== undefined) {
+          if (typeof nationality !== "string") {
+            return res.status(400).json({
+              message: "Nationality must be a string",
+            });
+          }
+
+          updates.nationality = nationality.trim();
+        }
+
+        if (Object.keys(updates).length === 1) {
+          return res.status(400).json({
+            message: "Please provide profile fields to update",
+          });
+        }
+
+        await usersCollection.updateOne(
+          { authUserId: req.user.id },
+          {
+            $set: updates,
+            $setOnInsert: {
+              authUserId: req.user.id,
+              email: req.user.email,
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true },
+        );
+
+        const user = await usersCollection.findOne({
+          authUserId: req.user.id,
+        });
+
+        console.log("[PROFILE] Updated successfully:", req.user.email);
+
+        return res.status(200).json({
+          success: true,
+          message: "Profile updated successfully",
+          user,
+          isAdmin: req.user.email === ADMIN_EMAIL,
+        });
+      } catch (error) {
+        return sendError(res, error, "Failed to update profile");
+      }
+    });
+
+    /* ---------- GET OWN BOOKINGS: JWT ---------- */
+
+    app.get("/bookings", requireJwtAuth, async (req, res) => {
+      console.log("[BOOKINGS] Fetching bookings for:", req.user.email);
+
+      try {
+        const user = await syncUser(req.user);
+
+        const bookings = await bookingsCollection
+          .find({ userId: req.user.id })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        return res.status(200).json({
+          user,
+          bookings,
+        });
+      } catch (error) {
+        return sendError(res, error, "Failed to fetch bookings");
+      }
+    });
+
+    /* ---------- CREATE BOOKING: AUTHENTICATED ---------- */
+
+    app.post("/bookings", requireAuth, async (req, res) => {
+      console.log("[BOOKINGS] Creating booking for:", req.user.email);
+
+      try {
+        const { destinationId, departure } = req.body;
+
+        if (!isValidId(destinationId)) {
+          return res.status(400).json({
+            message: "Invalid destination ID",
+          });
+        }
+
+        if (
+          typeof departure !== "string" ||
+          !/^\d{4}-\d{2}-\d{2}$/.test(departure)
+        ) {
+          return res.status(400).json({
+            message: "A valid departure date is required",
+          });
+        }
+
+        const user = await syncUser(req.user);
+
+        const destination = await destinationsCollection.findOne({
+          _id: new ObjectId(destinationId),
+        });
+
+        if (!destination) {
+          return res.status(404).json({
+            message: "Destination not found",
+          });
+        }
+
+        const existingBooking = await bookingsCollection.findOne({
+          userId: req.user.id,
+          destinationId: String(destination._id),
+          status: { $ne: "Cancelled" },
+        });
+
+        if (existingBooking) {
+          return res.status(409).json({
+            message: "You have already booked this destination",
+          });
+        }
+
+        const now = new Date();
+
+        const booking = {
+          userId: req.user.id,
+          email: user.email,
+          destinationId: String(destination._id),
+          title: destination.destinationName,
+          image: destination.imageUrl || "",
+          departure,
+          bookingId: `WB-${Date.now()}-${new ObjectId().toString().slice(-6)}`,
+          price: Number(destination.price),
+          status: "Pending",
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        const result = await bookingsCollection.insertOne(booking);
+
+        console.log(
+          "[BOOKINGS] Created successfully:",
+          result.insertedId.toString(),
+        );
+
+        return res.status(201).json({
+          success: true,
+          message: "Booking saved successfully!",
+          booking: {
+            _id: result.insertedId,
+            ...booking,
+          },
+        });
+      } catch (error) {
+        return sendError(res, error, "Failed to create booking");
+      }
+    });
+
+    /* ---------- CANCEL OWN BOOKING: JWT ---------- */
+
+    app.patch("/bookings/:id", requireJwtAuth, async (req, res) => {
+      console.log("[BOOKINGS] User booking update:", req.user.email);
+
+      try {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        if (!isValidId(id)) {
+          return res.status(400).json({
+            message: "Invalid booking ID",
+          });
+        }
+
+        if (status !== "Cancelled") {
+          return res.status(403).json({
+            message: "Users can only cancel their own bookings",
+          });
+        }
+
+        const result = await bookingsCollection.updateOne(
+          {
+            _id: new ObjectId(id),
+            userId: req.user.id,
+          },
+          {
+            $set: {
+              status: "Cancelled",
+              updatedAt: new Date(),
+            },
+          },
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({
+            message: "Booking not found",
+          });
+        }
+
+        const booking = await bookingsCollection.findOne({
+          _id: new ObjectId(id),
+          userId: req.user.id,
+        });
+
+        console.log("[BOOKINGS] Cancelled successfully:", id);
+
+        return res.status(200).json({
+          success: true,
+          message: "Booking cancelled successfully",
+          booking,
+        });
+      } catch (error) {
+        return sendError(res, error, "Failed to cancel booking");
+      }
+    });
+
+    /* ---------- ADMIN: GET ALL USERS ---------- */
+
+    app.get(
+      "/admin/users",
+      requireJwtAuth,
+      requireAdmin,
+      logProtectedRoute,
+      async (req, res) => {
+        console.log("[ADMIN USERS] Fetching all users");
+
+        try {
+          const users = await usersCollection
+            .find({})
+            .sort({ createdAt: -1 })
+            .toArray();
+
+          return res.status(200).json(
+            users.map((user) => ({
+              ...user,
+              isAdmin: user.email?.trim().toLowerCase() === ADMIN_EMAIL,
+            })),
+          );
+        } catch (error) {
+          return sendError(res, error, "Failed to fetch users");
+        }
+      },
+    );
+
+    /* ---------- ADMIN: GET ALL BOOKINGS ---------- */
+
+    app.get(
+      "/admin/bookings",
+      requireJwtAuth,
+      requireAdmin,
+      logProtectedRoute,
+      async (req, res) => {
+        console.log("[ADMIN BOOKINGS] Fetching all bookings");
+
+        try {
+          const bookings = await bookingsCollection
+            .find({})
+            .sort({ createdAt: -1 })
+            .toArray();
+
+          return res.status(200).json(bookings);
+        } catch (error) {
+          return sendError(res, error, "Failed to fetch all bookings");
+        }
+      },
+    );
+
+    /* ---------- ADMIN: UPDATE BOOKING ---------- */
+
+    app.patch(
+      "/admin/bookings/:id",
+      requireJwtAuth,
+      requireAdmin,
+      logProtectedRoute,
+      async (req, res) => {
+        console.log("[ADMIN BOOKINGS] Updating booking:", req.params.id);
+
+        try {
+          const { id } = req.params;
+          const { status } = req.body;
+
+          if (!isValidId(id)) {
+            return res.status(400).json({
+              message: "Invalid booking ID",
+            });
+          }
+
+          if (!["Pending", "Confirmed", "Cancelled"].includes(status)) {
+            return res.status(400).json({
+              message: "Invalid booking status",
+            });
+          }
+
+          const result = await bookingsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                status,
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+          if (result.matchedCount === 0) {
+            return res.status(404).json({
+              message: "Booking not found",
+            });
+          }
+
+          const booking = await bookingsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          console.log("[ADMIN BOOKINGS] Updated successfully:", id);
+
+          return res.status(200).json({
+            success: true,
+            message: "Booking status updated successfully",
+            booking,
+          });
+        } catch (error) {
+          return sendError(res, error, "Failed to update booking status");
+        }
+      },
+    );
+
+    /* ---------- NOT FOUND ---------- */
+
+    app.use((req, res) => {
+      console.warn("[404] Route not found:", req.method, req.originalUrl);
+
+      return res.status(404).json({
+        success: false,
+        message: `Route not found: ${req.method} ${req.originalUrl}`,
+      });
     });
 
     app.listen(PORT, () => {
-      console.log(`Wanderlust API running on http://localhost:${PORT}`);
-      console.log(`Better Auth URL: ${AUTH_BASE_URL}`);
-      console.log(`Frontend URL: ${FRONTEND_URL}`);
-      console.log(`Admin email configured: ${ADMIN_EMAIL}`);
+      console.log("\n========================================");
+      console.log("WANDERLUST BACKEND STARTED");
+      console.log(`API: http://localhost:${PORT}`);
+      console.log("MongoDB: Connected");
+      console.log("JWT verification: Enabled");
+      console.log("Admin route protection: Enabled");
+      console.log("JWT token values: Hidden");
+      console.log("========================================\n");
     });
   } catch (error) {
-    console.error("Failed to start Wanderlust API:", error);
-
-    try {
-      await client.close();
-    } catch {
-      // Ignore connection cleanup errors.
-    }
-
+    console.error("[SERVER] Startup failed:", error);
+    await client.close().catch(() => {});
     process.exit(1);
   }
 }
-
-process.on("SIGINT", async () => {
-  await client.close();
-  process.exit(0);
-});
-
-process.on("SIGTERM", async () => {
-  await client.close();
-  process.exit(0);
-});
 
 startServer();
