@@ -1017,6 +1017,47 @@ async function startServer() {
       }
     });
 
+    /* ---------- DELETE OWN CANCELLED BOOKING: JWT ---------- */
+
+    app.delete("/bookings/:id", requireJwtAuth, async (req, res) => {
+      console.log("[BOOKINGS] Removing booking:", req.params.id);
+      console.log("[BOOKINGS] Requested by:", req.user.email);
+
+      try {
+        const { id } = req.params;
+
+        if (!isValidId(id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid booking ID",
+          });
+        }
+
+        const result = await bookingsCollection.deleteOne({
+          _id: new ObjectId(id),
+          userId: req.user.id,
+          status: "Cancelled",
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({
+            success: false,
+            message:
+              "Cancelled booking not found or you are not authorized to remove it.",
+          });
+        }
+
+        console.log("[BOOKINGS] Removed successfully:", id);
+
+        return res.status(200).json({
+          success: true,
+          message: "Booking removed successfully!",
+        });
+      } catch (error) {
+        return sendError(res, error, "Failed to remove booking");
+      }
+    });
+
     /* ---------- ADMIN: GET ALL USERS ---------- */
 
     app.get(
